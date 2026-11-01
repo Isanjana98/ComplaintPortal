@@ -1,0 +1,19 @@
+# Local SQL Server for development.
+#   docker compose up -d
+# Then run database/01_schema.sql (e.g. with Azure Data Studio / SSMS / sqlcmd).
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: complaintportal-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Dev_Str0ng!Passw0rd"   # dev only - change it
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - ./database:/scripts:ro
+
+volumes:
+  mssql-data:

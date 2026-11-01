@@ -1,0 +1,159 @@
+using ComplaintPortal.Api.Models;
+using ComplaintPortal.Api.Options;
+using Microsoft.Extensions.Options;
+
+namespace ComplaintPortal.Api.Services;
+
+/// <summary>Thrown for user-correctable problems; the global handler turns it into a 400.</summary>
+public sealed class AppValidationException : Exception
+{
+    public AppValidationException(string message) : base(message) { }
+}
+
+public interface IFileStorageService
+{
+    Task<IReadOnlyList<NewAttachment>> SaveAsync(IReadOnlyList<IFormFile> files, CancellationToken ct);
+    Stream OpenRead(string storedFileName);
+    void Delete(string storedFileName);
+}
+
+/// <summary>
+/// Secure upload handling:
+///  * extension allow-list AND magic-byte (file signature) check - the client's Content-Type is ignored
+///  * size and count limits
+///  * random server-side file names (no path traversal, no overwriting, no executable extensions)
+///  * stored outside wwwroot so files are never served or executed directly
+/// </summary>
+public sealed class FileStorageService : IFileStorageService
+{
+    private sealed record FileType(string ContentType, byte[][] Signatures);
+
+    private static readonly Dictionary<string, FileType> Allowed = new(StringComparer.OrdinalIgnoreCase)
+    {
+        [".pdf"]  = new("application/pdf", new[] { new byte[] { 0x25, 0x50, 0x44, 0x46, 0x2D } }),           // %PDF-
+        [".png"]  = new("image/png",       new[] { new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A } }),
+        [".jpg"]  = new("image/jpeg",      new[] { new byte[] { 0xFF, 0xD8, 0xFF } }),
+        [".jpeg"] = new("image/jpeg",      new[] { new byte[] { 0xFF, 0xD8, 0xFF } }),
+    };
+
+    private readonly FileStorageOptions _options;
+    private readonly string _root;
+
+    public FileStorageService(IOptions<FileStorageOptions> options, IWebHostEnvironment env)
+    {
+        _options = options.Value;
+        _root = Path.GetFullPath(Path.IsPathRooted(_options.RootPath)
+            ? _options.RootPath
+            : Path.Combine(env.ContentRootPath, _options.RootPath));
+        Directory.CreateDirectory(_root);
+    }
+
+    public async Task<IReadOnlyList<NewAttachment>> SaveAsync(IReadOnlyList<IFormFile> files, CancellationToken ct)
+    {
+        if (files.Count > _options.MaxFilesPerComplaint)
+            throw new AppValidationException($"You can attach at most {_options.MaxFilesPerComplaint} files.");
+
+        // Validate everything before writing anything.
+        var validated = new List<(IFormFile File, FileType Type, string Ext)>();
+        foreach (var file in files)
+        {
+            if (file.Length == 0)
+                throw new AppValidationException($"'{SafeName(file.FileName)}' is empty.");
+            if (file.Length > _options.MaxFileSizeBytes)
+                throw new AppValidationException(
+                    $"'{SafeName(file.FileName)}' exceeds the {_options.MaxFileSizeBytes / (1024 * 1024)} MB limit.");
+
+            var ext = Path.GetExtension(file.FileName);
+            if (string.IsNullOrEmpty(ext) || !Allowed.TryGetValue(ext, out var type))
+                throw new AppValidationException($"'{SafeName(file.FileName)}' is not an allowed file type (PDF, PNG, JPG).");
+
+            if (!await HasValidSignatureAsync(file, type, ct))
+                throw new AppValidationException($"'{SafeName(file.FileName)}' content does not match its file type.");
+
+            validated.Add((file, type, ext.ToLowerInvariant()));
+        }
+
+        var saved = new List<NewAttachment>();
+        try
+        {
+            foreach (var (file, type, ext) in validated)
+            {
+                var storedName = $"{Guid.NewGuid():N}{ext}.bin";
+                var path = ResolveSafePath(storedName);
+
+                await using var target = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                await file.CopyToAsync(target, ct);
+
+                saved.Add(new NewAttachment
+                {
+                    OriginalFileName = SafeName(file.FileName),
+                    StoredFileName = storedName,
+                    ContentType = type.ContentType,
+                    SizeBytes = file.Length,
+                });
+            }
+        }
+        catch
+        {
+            foreach (var s in saved) Delete(s.StoredFileName);
+            throw;
+        }
+
+        return saved;
+    }
+
+    public Stream OpenRead(string storedFileName) =>
+        new FileStream(ResolveSafePath(storedFileName), FileMode.Open, FileAccess.Read, FileShare.Read);
+
+    public void Delete(string storedFileName)
+    {
+        try
+        {
+            var path = ResolveSafePath(storedFileName);
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch
+        {
+            // best-effort cleanup
+        }
+    }
+
+    private string ResolveSafePath(string storedFileName)
+    {
+        // Stored names are always generated by us, but defend in depth against traversal anyway.
+        if (storedFileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || storedFileName.Contains(".."))
+            throw new InvalidOperationException("Invalid stored file name.");
+
+        var full = Path.GetFullPath(Path.Combine(_root, storedFileName));
+        if (!full.StartsWith(_root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidOperationException("Resolved path escapes the upload root.");
+        return full;
+    }
+
+    private static async Task<bool> HasValidSignatureAsync(IFormFile file, FileType type, CancellationToken ct)
+    {
+        var maxLen = type.Signatures.Max(s => s.Length);
+        var header = new byte[maxLen];
+
+        await using var stream = file.OpenReadStream();
+        var read = 0;
+        while (read < maxLen)
+        {
+            var n = await stream.ReadAsync(header.AsMemory(read, maxLen - read), ct);
+            if (n == 0) break;
+            read += n;
+        }
+
+        return type.Signatures.Any(sig => read >= sig.Length && header.AsSpan(0, sig.Length).SequenceEqual(sig));
+    }
+
+    /// <summary>Keeps only the file name part and strips control/invalid characters.</summary>
+    private static string SafeName(string name)
+    {
+        var fileName = Path.GetFileName(name ?? string.Empty);
+        var invalid = Path.GetInvalidFileNameChars();
+        var cleaned = new string(fileName.Where(c => !char.IsControl(c) && !invalid.Contains(c)).ToArray()).Trim();
+        if (cleaned.Length == 0) cleaned = "file";
+        return cleaned.Length > 200 ? cleaned[..200] : cleaned;
+    }
+}

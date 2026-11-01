@@ -1,0 +1,16 @@
+# .NET
+bin/
+obj/
+publish/
+*.user
+.vs/
+backend/ComplaintPortal.Api/App_Data/
+backend/ComplaintPortal.Api/wwwroot/
+
+# Node
+node_modules/
+dist/
+
+# Secrets / env
+.env
+*.local
